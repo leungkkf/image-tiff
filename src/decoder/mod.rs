@@ -3,10 +3,7 @@ use std::collections::BTreeMap;
 use std::io::{self, Read, Seek};
 use std::num::NonZeroUsize;
 
-use crate::tags::{
-    CompressionMethod, IfdPointer, PhotometricInterpretation, PlanarConfiguration, Predictor,
-    SampleFormat, Tag, Type,
-};
+use crate::tags::{IfdPointer, PlanarConfiguration, Predictor, SampleFormat, Tag, Type};
 use crate::{
     bytecast, ColorType, Directory, TiffError, TiffFormatError, TiffResult, TiffUnsupportedError,
     UsageError,
@@ -19,6 +16,7 @@ use self::stream::{ByteOrder, EndianReader};
 mod cycles;
 pub mod ifd;
 mod image;
+mod pixel_format;
 mod stream;
 mod tag_reader;
 
@@ -622,24 +620,7 @@ impl<R: Read + Seek> Decoder<R> {
             ifd_offsets,
             current_ifd: None,
             seen_ifds: cycles::IfdCycles::new(),
-            image: Image {
-                ifd: None,
-                width: 0,
-                height: 0,
-                bits_per_sample: 1,
-                samples: 1,
-                sample_format: SampleFormat::Uint,
-                photometric_interpretation: PhotometricInterpretation::BlackIsZero,
-                compression_method: CompressionMethod::None,
-                jpeg_tables: None,
-                predictor: Predictor::None,
-                chunk_type: ChunkType::Strip,
-                planar_config: PlanarConfiguration::Chunky,
-                strip_decoder: None,
-                tile_attributes: None,
-                chunk_offsets: Vec::new(),
-                chunk_bytes: Vec::new(),
-            },
+            image: Image::default(),
         };
         decoder.next_image()?;
         Ok(decoder)
@@ -1240,6 +1221,20 @@ impl<R: Read + Seek> Decoder<R> {
         }
 
         Ok(())
+    }
+
+    /// Get the image in RGB 8_8_8 format.
+    pub fn get_image_rgb888(&mut self) -> TiffResult<Vec<(u8, u8, u8)>> {
+        let result = self.read_image()?;
+
+        self.image().to_pixel_format(result)
+    }
+
+    /// Get the image in RGB 32 format.
+    pub fn get_image_rgb32(&mut self) -> TiffResult<Vec<u32>> {
+        let result = self.read_image()?;
+
+        self.image().to_pixel_format(result)
     }
 
     /// Get the IFD decoder for our current image IFD.

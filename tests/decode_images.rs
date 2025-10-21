@@ -55,6 +55,38 @@ fn test_image_color_type_unsupported(file: &str, expected_type: ColorType) {
 }
 
 #[test]
+fn test_rgb8_8_8_palette() {
+    let path = PathBuf::from(TEST_IMAGE_DIR).join("palette-1c-8b.tiff");
+    let img_file = File::open(path).expect("Cannot find test image!");
+    let mut decoder = Decoder::new(img_file).expect("Cannot create decoder");
+
+    let result = decoder.get_image_rgb888().unwrap();
+
+    let sum: u64 = result
+        .into_iter()
+        .map(|(r, g, b)| r as u64 + g as u64 + b as u64)
+        .sum();
+
+    assert_eq!(sum, 7882692);
+}
+
+#[test]
+fn test_rgb32_palette() {
+    let path = PathBuf::from(TEST_IMAGE_DIR).join("palette-1c-8b.tiff");
+    let img_file = File::open(path).expect("Cannot find test image!");
+    let mut decoder = Decoder::new(img_file).expect("Cannot create decoder");
+
+    let result = decoder.get_image_rgb32().unwrap();
+
+    let sum: u64 = result
+        .into_iter()
+        .map(|v| (((v >> 16) & 0xff) + ((v >> 8) & 0xff) + (v & 0xff)) as u64)
+        .sum();
+
+    assert_eq!(sum, 7882692);
+}
+
+#[test]
 fn test_cmyk_u8() {
     test_image_sum_u8("cmyk-3c-8b.tiff", ColorType::CMYK(8), 8522658);
 }

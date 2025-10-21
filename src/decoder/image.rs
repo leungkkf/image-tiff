@@ -3,13 +3,14 @@ use super::stream::PackBitsReader;
 use super::tag_reader::TagReader;
 use super::ChunkType;
 use super::{predict_f16, predict_f32, predict_f64, ValueReader};
+use crate::decoder::pixel_format::PixelFormatConverter;
+use crate::decoder::DecodingResult;
 use crate::tags::{
     CompressionMethod, PhotometricInterpretation, PlanarConfiguration, Predictor, SampleFormat, Tag,
 };
 use crate::{
     ColorType, Directory, TiffError, TiffFormatError, TiffResult, TiffUnsupportedError, UsageError,
 };
-
 use std::io::{self, Cursor, Read, Seek};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -62,6 +63,28 @@ impl TileAttributes {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ColorTableElement {
+    pub(crate) r: u8,
+    pub(crate) g: u8,
+    pub(crate) b: u8,
+}
+
+impl ColorTableElement {
+    pub(crate) fn new(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ColorLookupTable(Vec<ColorTableElement>);
+
+impl ColorLookupTable {
+    pub(crate) fn lookup(&self, i: usize) -> ColorTableElement {
+        self.0[i]
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Image {
     pub ifd: Option<Directory>,
@@ -80,6 +103,31 @@ pub(crate) struct Image {
     pub tile_attributes: Option<TileAttributes>,
     pub chunk_offsets: Vec<u64>,
     pub chunk_bytes: Vec<u64>,
+    pub palette: Option<Vec<u16>>,
+}
+
+impl Default for Image {
+    fn default() -> Self {
+        Image {
+            ifd: None,
+            width: 0,
+            height: 0,
+            bits_per_sample: 1,
+            samples: 1,
+            sample_format: SampleFormat::Uint,
+            photometric_interpretation: PhotometricInterpretation::BlackIsZero,
+            compression_method: CompressionMethod::None,
+            jpeg_tables: None,
+            predictor: Predictor::None,
+            chunk_type: ChunkType::Strip,
+            planar_config: PlanarConfiguration::Chunky,
+            strip_decoder: None,
+            tile_attributes: None,
+            chunk_offsets: Vec::new(),
+            chunk_bytes: Vec::new(),
+            palette: None,
+        }
+    }
 }
 
 impl Image {
@@ -201,6 +249,22 @@ impl Image {
             PlanarConfiguration::Planar => samples,
         };
 
+        let palette = if let PhotometricInterpretation::RGBPalette = photometric_interpretation {
+            let palette = tag_reader
+                .find_tag(Tag::ColorMap)?
+                .expect("colour map should exist")
+                .into_u16_vec()?;
+
+            if palette.len() != 3 * (1 << bits_per_sample[0]) {
+                return Err(TiffError::FormatError(
+                    TiffFormatError::InconsistentSizesEncountered,
+                ));
+            }
+            Some(palette)
+        } else {
+            None
+        };
+
         let chunk_type;
         let chunk_offsets;
         let chunk_bytes;
@@ -305,6 +369,7 @@ impl Image {
             tile_attributes,
             chunk_offsets,
             chunk_bytes,
+            palette,
         })
     }
 
@@ -356,15 +421,22 @@ impl Image {
                     }),
                 }
             }
+            PhotometricInterpretation::RGBPalette => match self.bits_per_sample {
+                8 => Ok(ColorType::Palette(self.bits_per_sample)),
+                _ => Err(TiffError::UnsupportedError(
+                    TiffUnsupportedError::InterpretationWithBits(
+                        self.photometric_interpretation,
+                        vec![self.bits_per_sample; self.samples as usize],
+                    ),
+                )),
+            },
             // TODO: this is bad we should not fail at this point
-            PhotometricInterpretation::RGBPalette
-            | PhotometricInterpretation::TransparencyMask
-            | PhotometricInterpretation::CIELab => Err(TiffError::UnsupportedError(
-                TiffUnsupportedError::InterpretationWithBits(
+            PhotometricInterpretation::TransparencyMask | PhotometricInterpretation::CIELab => Err(
+                TiffError::UnsupportedError(TiffUnsupportedError::InterpretationWithBits(
                     self.photometric_interpretation,
                     vec![self.bits_per_sample; self.samples as usize],
-                ),
-            )),
+                )),
+            ),
         }
     }
 
@@ -560,6 +632,129 @@ impl Image {
         }
     }
 
+    /// Create a colour lookup table for the conversion to RGB.
+    pub(crate) fn create_color_lookup_table(&self) -> TiffResult<ColorLookupTable> {
+        // let size: usize = 1 << self.bits_per_sample;
+        let mut table = vec![ColorTableElement::default(); 1 << self.bits_per_sample];
+
+        match self.photometric_interpretation {
+            // PhotometricInterpretation::BlackIsZero => {
+            //     let size = size as f64;
+
+            //     for (v, c) in table.iter_mut().enumerate() {
+            //         let v = v as f64;
+            //         let v = ((v * 255.0) / (size - 1.0)) as u8;
+
+            //         *c = ColorTableElement::new(v, v, v);
+            //     }
+            // }
+            // PhotometricInterpretation::WhiteIsZero => {
+            //     let size = size as f64;
+
+            //     for (v, c) in table.iter_mut().enumerate() {
+            //         let v = v as f64;
+            //         let v = ((((size - 1.0) - v) * 255.0) / (size - 1.0)) as u8;
+
+            //         *c = ColorTableElement::new(v, v, v);
+            //     }
+            // }
+            // PhotometricInterpretation::CIELab => {}
+            // PhotometricInterpretation::CMYK => {}
+            // PhotometricInterpretation::RGB => {}
+            PhotometricInterpretation::RGBPalette => {
+                let one_color_offset = 1 << self.bits_per_sample;
+                let two_color_offset = 2 * one_color_offset;
+                let palette = self
+                    .palette
+                    .as_ref()
+                    .ok_or(TiffError::FormatError(TiffFormatError::MissingPalette))?;
+
+                let r_map = &palette[0..one_color_offset];
+                let g_map = &palette[one_color_offset..two_color_offset];
+                let b_map = &palette[two_color_offset..];
+
+                for (((c, r), g), b) in table.iter_mut().zip(r_map).zip(g_map).zip(b_map) {
+                    let r = (*r as f32 * 255.0 / u16::MAX as f32 + 0.5).clamp(0.0, 255.0) as u8;
+                    let g = (*g as f32 * 255.0 / u16::MAX as f32 + 0.5).clamp(0.0, 255.0) as u8;
+                    let b = (*b as f32 * 255.0 / u16::MAX as f32 + 0.5).clamp(0.0, 255.0) as u8;
+
+                    *c = ColorTableElement::new(r, g, b);
+                }
+            }
+            // PhotometricInterpretation::TransparencyMask => {}
+            // PhotometricInterpretation::YCbCr => {}
+            _ => {
+                return Err(TiffError::UnsupportedError(
+                    TiffUnsupportedError::UnsupportedInterpretation(
+                        self.photometric_interpretation,
+                    ),
+                ));
+            }
+        }
+        Ok(ColorLookupTable(table))
+    }
+
+    pub(crate) fn to_pixel_format<T>(&self, decoding_result: DecodingResult) -> TiffResult<T>
+    where
+        T: PixelFormatConverter + std::iter::FromIterator<<T as PixelFormatConverter>::PixelType>,
+    {
+        match self.photometric_interpretation {
+            // Bilevel/Gray
+            PhotometricInterpretation::BlackIsZero | PhotometricInterpretation::WhiteIsZero => {
+                let color_lookup_table = self.create_color_lookup_table()?;
+
+                match decoding_result {
+                    DecodingResult::U8(result) => Ok(result
+                        .iter()
+                        .map(|v| T::convert_element(color_lookup_table.lookup(*v as usize)))
+                        .collect()),
+                    DecodingResult::U16(result) => Ok(result
+                        .iter()
+                        .map(|v| T::convert_element(color_lookup_table.lookup(*v as usize)))
+                        .collect()),
+                    _ => Err(TiffError::UnsupportedError(
+                        crate::TiffUnsupportedError::UnsupportedSampleDepth(self.bits_per_sample),
+                    )),
+                }
+            }
+            // RGB palette
+            PhotometricInterpretation::RGBPalette => {
+                let color_lookup_table = self.create_color_lookup_table()?;
+
+                match decoding_result {
+                    DecodingResult::U8(result) => Ok(result
+                        .iter()
+                        .map(|v| T::convert_element(color_lookup_table.lookup(*v as usize)))
+                        .collect()),
+                    _ => Err(TiffError::UnsupportedError(
+                        crate::TiffUnsupportedError::UnsupportedSampleDepth(self.bits_per_sample),
+                    )),
+                }
+            }
+            // Raw RGB
+            PhotometricInterpretation::RGB => match decoding_result {
+                DecodingResult::U8(result) => Ok(result
+                    .iter()
+                    .zip(result.iter().skip(1))
+                    .zip(result.iter().skip(2))
+                    .map(|((r, g), b)| T::convert_element(ColorTableElement::new(*r, *g, *b)))
+                    .collect()),
+                _ => Err(TiffError::UnsupportedError(
+                    crate::TiffUnsupportedError::UnsupportedSampleDepth(self.bits_per_sample),
+                )),
+            },
+            // CIELab/CMYK/TransparencyMask/YCbCr
+            PhotometricInterpretation::CIELab
+            | PhotometricInterpretation::CMYK
+            | PhotometricInterpretation::TransparencyMask
+            | PhotometricInterpretation::YCbCr => Err(TiffError::UnsupportedError(
+                crate::TiffUnsupportedError::UnsupportedPhotometricInterpretation(
+                    self.photometric_interpretation,
+                ),
+            )),
+        }
+    }
+
     pub(crate) fn expand_chunk(
         &self,
         reader: &mut ValueReader<impl Read>,
@@ -606,6 +801,7 @@ impl Image {
                     ));
                 }
             },
+            ColorType::Palette(8) => {}
             type_ => {
                 return Err(TiffError::UnsupportedError(
                     TiffUnsupportedError::UnsupportedColorType(type_),

@@ -78,7 +78,7 @@ pub enum Tag(u16) unknown(
     CellLength = 265, // TODO add support
     CellWidth = 264, // TODO add support
     // palette-color images (PhotometricInterpretation 3)
-    ColorMap = 320, // TODO add support
+    ColorMap = 320,
     Compression = 259, // TODO add support for 2 and 32773
     DateTime = 306,
     ExtraSamples = 338, // TODO add support

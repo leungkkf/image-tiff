@@ -102,6 +102,9 @@ quick_error! {
         CompressedDataCorrupt(message: String) {
             display("compressed data is corrupt: {message}")
         }
+        MissingPalette {
+            display("file should contain a color palette")
+        }
     }
 }
 
@@ -158,6 +161,9 @@ quick_error! {
         }
         MisalignedTileBoundaries {
             display("tile rows are not aligned to byte boundaries")
+        }
+        UnsupportedPhotometricInterpretation(interpretation: PhotometricInterpretation) {
+            display("unsupported photometric interpretation")
         }
     }
 }
