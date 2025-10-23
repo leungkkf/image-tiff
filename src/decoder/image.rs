@@ -3,6 +3,7 @@ use super::stream::PackBitsReader;
 use super::tag_reader::TagReader;
 use super::ChunkType;
 use super::{predict_f16, predict_f32, predict_f64, ValueReader};
+use crate::decoder::color::{CieLab, ColorConverter, ReferenceWhite};
 use crate::decoder::pixel_format::PixelFormatConverter;
 use crate::decoder::DecodingResult;
 use crate::tags::{
@@ -104,6 +105,7 @@ pub(crate) struct Image {
     pub chunk_offsets: Vec<u64>,
     pub chunk_bytes: Vec<u64>,
     pub palette: Option<Vec<u16>>,
+    pub ref_white: Option<ReferenceWhite>,
 }
 
 impl Default for Image {
@@ -126,6 +128,7 @@ impl Default for Image {
             chunk_offsets: Vec::new(),
             chunk_bytes: Vec::new(),
             palette: None,
+            ref_white: None,
         }
     }
 }
@@ -157,6 +160,33 @@ impl Image {
         let compression_method = match tag_reader.find_tag(Tag::Compression)? {
             Some(val) => CompressionMethod::from_u16_exhaustive(val.into_u16()?),
             None => CompressionMethod::None,
+        };
+
+        let ref_white = if photometric_interpretation == PhotometricInterpretation::CIELab {
+            let white_point = if let Some(white_point) = tag_reader
+                .find_tag(Tag::WhitePoint)?
+                .map(Value::into_f32_vec)
+                .transpose()?
+            {
+                white_point
+            } else {
+                // TIFF 6.0: Generally, D65 illumination is used and a perfect reflecting diffuser is used for the reference white.
+                vec![0.31272, 0.32903]
+            };
+
+            if white_point.len() < 2 {
+                return Err(TiffError::FormatError(
+                    TiffFormatError::InvalidTagValueType(Tag::WhitePoint),
+                ));
+            }
+
+            Some(ReferenceWhite::new(
+                white_point[0] / white_point[1] * 100.0,
+                100.0,
+                (1.0 - white_point[0] - white_point[1]) / white_point[1] * 100.0,
+            ))
+        } else {
+            None
         };
 
         let jpeg_tables = if compression_method == CompressionMethod::ModernJPEG
@@ -370,6 +400,7 @@ impl Image {
             chunk_offsets,
             chunk_bytes,
             palette,
+            ref_white,
         })
     }
 
@@ -430,13 +461,22 @@ impl Image {
                     ),
                 )),
             },
+            PhotometricInterpretation::CIELab => match self.bits_per_sample {
+                8 => Ok(ColorType::CieLab(self.bits_per_sample)),
+                _ => Err(TiffError::UnsupportedError(
+                    TiffUnsupportedError::InterpretationWithBits(
+                        self.photometric_interpretation,
+                        vec![self.bits_per_sample; self.samples as usize],
+                    ),
+                )),
+            },
             // TODO: this is bad we should not fail at this point
-            PhotometricInterpretation::TransparencyMask | PhotometricInterpretation::CIELab => Err(
-                TiffError::UnsupportedError(TiffUnsupportedError::InterpretationWithBits(
+            PhotometricInterpretation::TransparencyMask => Err(TiffError::UnsupportedError(
+                TiffUnsupportedError::InterpretationWithBits(
                     self.photometric_interpretation,
                     vec![self.bits_per_sample; self.samples as usize],
-                )),
-            ),
+                ),
+            )),
         }
     }
 
@@ -696,7 +736,7 @@ impl Image {
 
     pub(crate) fn to_pixel_format<T>(&self, decoding_result: DecodingResult) -> TiffResult<T>
     where
-        T: PixelFormatConverter + std::iter::FromIterator<<T as PixelFormatConverter>::PixelType>,
+        T: PixelFormatConverter,
     {
         match self.photometric_interpretation {
             // Bilevel/Gray
@@ -732,20 +772,58 @@ impl Image {
                 }
             }
             // Raw RGB
-            PhotometricInterpretation::RGB => match decoding_result {
-                DecodingResult::U8(result) => Ok(result
-                    .iter()
-                    .zip(result.iter().skip(1))
-                    .zip(result.iter().skip(2))
-                    .map(|((r, g), b)| T::convert_element(ColorTableElement::new(*r, *g, *b)))
-                    .collect()),
-                _ => Err(TiffError::UnsupportedError(
-                    crate::TiffUnsupportedError::UnsupportedSampleDepth(self.bits_per_sample),
-                )),
-            },
-            // CIELab/CMYK/TransparencyMask/YCbCr
-            PhotometricInterpretation::CIELab
-            | PhotometricInterpretation::CMYK
+            // PhotometricInterpretation::RGB => match decoding_result {
+            //     DecodingResult::U8(result) => Ok(result
+            //         .iter()
+            //         .step_by(3)
+            //         .zip(result.iter().skip(1))
+            //         .zip(result.iter().skip(2))
+            //         .map(|((r, g), b)| T::convert_element(ColorTableElement::new(*r, *g, *b)))
+            //         .collect()),
+            //     _ => Err(TiffError::UnsupportedError(
+            //         crate::TiffUnsupportedError::UnsupportedSampleDepth(self.bits_per_sample),
+            //     )),
+            // },
+            PhotometricInterpretation::CIELab => {
+                let color_converter = ColorConverter::build(self.ref_white.as_ref().unwrap());
+
+                if self.planar_config != PlanarConfiguration::Chunky {
+                    return Err(TiffError::UnsupportedError(
+                        crate::TiffUnsupportedError::UnsupportedPlanarConfig(Some(
+                            self.planar_config,
+                        )),
+                    ));
+                }
+
+                let steps = self.samples as usize;
+
+                match decoding_result {
+                    DecodingResult::U8(result) => {
+                        Ok(result
+                            .iter()
+                            .step_by(steps)
+                            .zip(result.iter().skip(1).step_by(steps))
+                            .zip(result.iter().skip(2).step_by(steps))
+                            .map(|((l, a), b)| {
+                                // TIFF 6.0: The L* range is from 0 (perfect absorbing black) to 100 (perfect reflecting diffuse white).
+                                // The a* and b* ranges will be represented as **signed 8 bit values*** having the range -127 to +127.
+                                let l = (*l as f32) / 255.0 * 100.0;
+                                let a = *a as i8 as f32;
+                                let b = *b as i8 as f32;
+                                let rgb = color_converter.cielab_to_rgb(CieLab::new(l, a, b));
+
+                                T::convert_element(ColorTableElement::new(rgb.0, rgb.1, rgb.2))
+                            })
+                            .collect())
+                    }
+                    _ => Err(TiffError::UnsupportedError(
+                        crate::TiffUnsupportedError::UnsupportedSampleDepth(self.bits_per_sample),
+                    )),
+                }
+            }
+            // CMYK/TransparencyMask/YCbCr
+            PhotometricInterpretation::CMYK
+            | PhotometricInterpretation::RGB
             | PhotometricInterpretation::TransparencyMask
             | PhotometricInterpretation::YCbCr => Err(TiffError::UnsupportedError(
                 crate::TiffUnsupportedError::UnsupportedPhotometricInterpretation(
@@ -802,6 +880,7 @@ impl Image {
                 }
             },
             ColorType::Palette(8) => {}
+            ColorType::CieLab(8) => {}
             type_ => {
                 return Err(TiffError::UnsupportedError(
                     TiffUnsupportedError::UnsupportedColorType(type_),

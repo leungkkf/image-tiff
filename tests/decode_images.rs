@@ -87,6 +87,60 @@ fn test_rgb32_palette() {
 }
 
 #[test]
+fn test_cielab() {
+    let path = PathBuf::from(TEST_IMAGE_DIR).join("color_checker_calculator.tiff");
+    let img_file = File::open(path).expect("Cannot find test image!");
+    let mut decoder = Decoder::new(img_file).expect("Cannot create decoder");
+
+    let mut raw_result: Vec<u8> = vec![0; 1307124];
+
+    decoder.read_image_bytes(&mut raw_result).unwrap();
+
+    let result = decoder.get_image_rgb888().unwrap();
+    let dims = decoder.dimensions().unwrap();
+    let mut output_rgb = Vec::new();
+
+    for y in 0..4 {
+        for x in 0..6 {
+            let index = (28 + 28 * dims.0 + (x + y * dims.0) * 126 + (10 + 10 * dims.0)) as usize;
+
+            output_rgb.push(result[index as usize]);
+        }
+    }
+
+    // Compare with the results from the calculator (http://www.brucelindbloom.com/)
+    // using Ref White "D65", Adaptation "None", Gamma "sRGB", RGB Model "sRGB"
+    let expected_rgb = [
+        (118, 80, 63),
+        (200, 150, 130),
+        (83, 124, 156),
+        (91, 108, 66),
+        (124, 129, 176),
+        (95, 189, 172),
+        (225, 123, 37),
+        (48, 94, 165),
+        (203, 84, 97),
+        (88, 61, 105),
+        (167, 186, 65),
+        (240, 164, 44),
+        (0, 63, 152),
+        (75, 148, 72),
+        (187, 42, 55),
+        (249, 199, 34),
+        (192, 84, 146),
+        (0, 134, 168),
+        (243, 241, 238),
+        (202, 202, 202),
+        (161, 161, 161),
+        (123, 122, 121),
+        (83, 83, 83),
+        (49, 49, 49),
+    ];
+
+    assert_eq!(output_rgb, expected_rgb);
+}
+
+#[test]
 fn test_cmyk_u8() {
     test_image_sum_u8("cmyk-3c-8b.tiff", ColorType::CMYK(8), 8522658);
 }

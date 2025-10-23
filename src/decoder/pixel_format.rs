@@ -1,7 +1,7 @@
 use crate::decoder::image::ColorTableElement;
 
 /// Convert the decoded bytes into another pixel format.
-pub(crate) trait PixelFormatConverter {
+pub(crate) trait PixelFormatConverter: std::iter::FromIterator<Self::PixelType> {
     type PixelType;
 
     /// Convert a colour table element into the required pixel type.
