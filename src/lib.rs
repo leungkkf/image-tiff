@@ -46,6 +46,9 @@ pub enum ColorType {
 
     /// Pixel has multiple bands/channels
     Multiband { bit_depth: u8, num_samples: u16 },
+
+    /// Pixel contains L*, a* and b* channels.
+    CieLab(u8),
 }
 impl ColorType {
     fn bit_depth(&self) -> u8 {
@@ -58,6 +61,7 @@ impl ColorType {
             | ColorType::CMYK(b)
             | ColorType::CMYKA(b)
             | ColorType::YCbCr(b)
+            | ColorType::CieLab(b)
             | ColorType::Multiband { bit_depth: b, .. } => b,
         }
     }

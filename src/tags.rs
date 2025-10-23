@@ -111,6 +111,7 @@ pub enum Tag(u16) unknown(
     YResolution = 283,
     // Advanced tags
     Predictor = 317,
+    WhitePoint = 318,
     TileWidth = 322,
     TileLength = 323,
     TileOffsets = 324,

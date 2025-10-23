@@ -13,6 +13,7 @@ use half::f16;
 use self::image::Image;
 use self::stream::{ByteOrder, EndianReader};
 
+mod color;
 mod cycles;
 pub mod ifd;
 mod image;
